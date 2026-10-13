@@ -1,0 +1,6 @@
+/target
+# Evidence samples from real systems: keep them out of version control.
+/samples/
+
+# Marketing drafts; may contain real-evidence screenshots.
+/linkedin/

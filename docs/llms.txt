@@ -1,0 +1,20 @@
+# Sediment
+
+> Sediment is a desktop explorer for Windows forensic artifacts: the NTFS $MFT, the USN change journal ($UsnJrnl:$J and $Max) and Prefetch (.pf) files, with links between them. For DFIR analysts, incident responders and threat hunters.
+
+- Platforms: Windows 10 or newer (x64, ARM64), macOS 11 or newer (Apple Silicon and Intel), Linux x64 and ARM64 (glibc 2.35+).
+- $MFT: folder tree rebuilt from parent references, deleted entries, hard links, all attributes decoded ($SI/$FN timestamps, data runs, ADS, raw hex), timestomping flag.
+- Extracts resident file content and alternate data streams from MFT records into a ZIP with the password "infected".
+- USN journal: table and folder tree with activity and deletion counts; paths resolved through the $MFT or the journal itself.
+- Prefetch: format versions 17 to 31 (Windows XP to 11), including Windows 10+ compressed files on any OS; run counts and times, loaded files, known attacker tools, capability hints.
+- Cross-artifact pivots: MFT to journal, prefetch to MFT and journal, MFT to prefetch; back/forward navigation.
+- Runs entirely locally with no network access.
+- License: PolyForm Small Business 1.0.0 (free for organizations under 100 people and US$1M revenue).
+- Install on Windows: `irm https://nyanites.github.io/sediment/install.ps1 | iex`
+- Install on macOS or Linux: `curl -fsSL https://nyanites.github.io/sediment/install.sh | sh`
+
+## Links
+
+- [Website](https://nyanites.github.io/sediment/)
+- [Source code and documentation](https://github.com/Nyanites/sediment)
+- [Releases](https://github.com/Nyanites/sediment/releases)

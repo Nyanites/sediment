@@ -1,0 +1,23 @@
+[package]
+name = "sediment"
+version = "0.1.0"
+edition = "2024"
+description = "Sediment - Windows forensic artifact explorer ($MFT, USN journal, Prefetch)"
+license-file = "LICENSE.md"
+repository = "https://github.com/Nyanites/sediment"
+homepage = "https://nyanites.github.io/sediment/"
+publish = false
+
+[dependencies]
+chrono = "0.4.45"
+eframe = "0.36.2"
+egui_extras = "0.36.2"
+rfd = "0.17.2"
+
+[build-dependencies]
+winresource = "0.1.33"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
