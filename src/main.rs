@@ -1,15 +1,24 @@
 ﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod detect;
 mod extract;
+mod image;
+mod intel;
+mod lznt1;
+mod net;
+mod ntfs;
 #[cfg(test)]
 mod fuzz_tests;
 mod mft;
 mod prefetch;
+mod settings;
+mod update;
 mod usn;
 mod xpress;
 
 fn main() -> eframe::Result {
+    update::cleanup();
     let initial = app::file_args();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()

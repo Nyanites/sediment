@@ -180,14 +180,17 @@ fn exercise_record(rec: &Record, no: usize) {
         let _ = (a.data_size(), a.resident_content(&rec.data));
         let _ = (a.standard_info(&rec.data), a.file_name(&rec.data));
     }
-    let _ = (extract::streams(rec).len(), extract::file_name(rec));
-    let _ = (extract::resident_zip(rec, no), extract::zip_file_name(rec, no));
+    let recs = std::slice::from_ref(rec);
+    let _ = (extract::streams(recs).len(), extract::file_name(recs));
+    let _ = (extract::resident_zip(recs, no), extract::zip_file_name(recs, no));
 }
 
 fn exercise_mft(raw: Vec<u8>) {
     let f = MftFile::load(raw, &AtomicUsize::new(0));
     for i in 0..f.entries.len() + 2 {
         exercise_record(&f.parse_record(i), i);
+        let recs = f.file_records(i);
+        let _ = (extract::resident_zip(&recs, i), extract::zip_file_name(&recs, i));
     }
     for e in &f.entries {
         assert!(e.path.len() <= 9 * 1024, "path of {} bytes", e.path.len());

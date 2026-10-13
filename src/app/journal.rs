@@ -89,6 +89,17 @@ pub(super) struct JournalView {
     scroll_to_row: Option<usize>,
 }
 
+impl JournalView {
+    /// Clears the filters that could hide entries (for jumping to detections).
+    pub(super) fn clear_filters(&mut self) {
+        self.filter.clear();
+        self.reason = ReasonFilter::Any;
+        self.kind = KindFilter::All;
+        self.ref_filter = None;
+        self.dirty = true;
+    }
+}
+
 impl Default for JournalView {
     fn default() -> Self {
         Self {
@@ -369,6 +380,7 @@ impl MftApp {
             if let Some(j) = &mut self.journal {
                 resolve_paths(j, self.file.as_ref());
                 self.jtree.rebuild(j);
+                self.det.dirty = true;
             }
             self.refresh_journal_links();
             if self.file.is_some() {
@@ -382,7 +394,11 @@ impl MftApp {
         jv.view.clear();
         let matcher = Matcher::new(&jv.filter);
         let mask = jv.reason.mask();
+        let only = self.det.filter();
         for (i, r) in j.records.iter().enumerate() {
+            if only.is_some_and(|f| !f.contains(&crate::detect::Target::Journal(i as u32))) {
+                continue;
+            }
             if r.reason & mask == 0 {
                 continue;
             }
@@ -552,6 +568,8 @@ impl MftApp {
         let mut show_mft: Option<u64> = None;
         let mut go_folder: Option<usize> = None;
         let jv = &mut self.jv;
+        let det = &self.det;
+        let dark = ui.visuals().dark_mode;
         let selected = jv.selected;
         let (sort_col, sort_asc) = (jv.sort_col, jv.sort_asc);
         let have_mft = self.file.is_some();
@@ -618,6 +636,10 @@ impl MftApp {
                                 let mut t = RichText::new(jcell(r, *c));
                                 if matches!(c, JCol::Name | JCol::Reason)
                                     && let Some(col) = color {
+                                        t = t.color(col);
+                                    }
+                                if *c == JCol::Name
+                                    && let Some(col) = det.color(crate::detect::Target::Journal(idx as u32), dark) {
                                         t = t.color(col);
                                     }
                                 if matches!(
@@ -725,6 +747,7 @@ impl MftApp {
             });
         });
         ui.label(RichText::new(&r.name).strong());
+        let det_click = self.detection_links(ui, crate::detect::Target::Journal(idx as u32));
         ui.horizontal(|ui| {
             go_folder = ui.button("🗁 Go to folder").clicked();
             only_file = ui.button("Only this file's entries").clicked();
@@ -790,6 +813,9 @@ impl MftApp {
         }
         if go_folder {
             self.journal_go_to_folder(idx);
+        }
+        if let Some(rule) = det_click {
+            self.set_detection(Some(super::detections::Active::Rule(rule)));
         }
     }
 

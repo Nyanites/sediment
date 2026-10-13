@@ -156,6 +156,30 @@ impl UsnJournal {
         pos + 8 <= d.len() && parse_record(d, pos).is_some()
     }
 
+    /// Stricter `sniff` for picking journals out of a folder of unrelated
+    /// files: the first `min` records must all decode.
+    pub fn sniff_records(d: &[u8], min: usize) -> bool {
+        let mut pos = 0;
+        while pos + 8 <= d.len() && u32_at(d, pos) == 0 {
+            pos += 8;
+        }
+        let mut found = 0;
+        while found < min && pos + 8 <= d.len() {
+            if u32_at(d, pos) == 0 {
+                pos = (pos / PAGE + 1) * PAGE;
+                continue;
+            }
+            match parse_record(d, pos) {
+                Some(r) => {
+                    found += 1;
+                    pos += r.length as usize;
+                }
+                None => return false,
+            }
+        }
+        found >= min
+    }
+
     pub fn load(raw: Vec<u8>, progress: &AtomicUsize) -> UsnJournal {
         let mut records = Vec::new();
         let mut skipped = 0;

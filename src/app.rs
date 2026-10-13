@@ -16,6 +16,10 @@ use crate::usn::{UsnJournal, UsnMax};
 mod journal;
 mod journal_tree;
 mod nav;
+mod detections;
+mod disk;
+mod online;
+mod open;
 mod pf;
 mod search;
 
@@ -158,6 +162,7 @@ enum DetailTab {
     Summary,
     Attributes,
     Hex,
+    Content,
     Journal,
 }
 
@@ -187,6 +192,8 @@ enum Loaded {
     Journal(UsnJournal),
     Max(UsnMax),
     Prefetch(Vec<pf::PfEntry>),
+    Folder(open::FolderPlan),
+    Image(disk::ImageLoad),
 }
 
 fn is_prefetch(raw: &[u8]) -> bool {
@@ -256,6 +263,19 @@ pub struct MftApp {
     loading: Vec<Loading>,
     error: Option<String>,
     status_msg: Option<String>,
+    /// What the last open action loaded, and what it couldn't.
+    report: Vec<open::ReportItem>,
+    /// The folder the report's paths are shown relative to.
+    report_root: Option<PathBuf>,
+    report_open: bool,
+    /// The disk image (or live drive) the `$MFT` came from, for content in clusters.
+    volume: Option<Arc<crate::ntfs::Volume>>,
+    volume_label: String,
+    jobs: Vec<disk::Job>,
+    need_image: Option<disk::NeedImage>,
+    /// What to do once the image being opened is attached.
+    after_image: Option<disk::NeedImage>,
+    det: detections::DetState,
 
     filter: String,
     state_filter: StateFilter,
@@ -271,6 +291,12 @@ pub struct MftApp {
 
     selected: Option<usize>,
     selected_record: Option<Record>,
+    /// The selected file's base and extension records, for extraction.
+    selected_file: Vec<Record>,
+    /// Their record numbers, base record first.
+    selected_members: Vec<usize>,
+    selected_streams: Vec<online::StreamInfo>,
+    online: online::Online,
     scroll_to_row: Option<usize>,
     tab: DetailTab,
 
@@ -305,6 +331,15 @@ impl MftApp {
             loading: Vec::new(),
             error: None,
             status_msg: None,
+            report: Vec::new(),
+            report_root: None,
+            report_open: false,
+            volume: None,
+            volume_label: String::new(),
+            jobs: Vec::new(),
+            need_image: None,
+            after_image: None,
+            det: detections::DetState::default(),
             filter: String::new(),
             state_filter: StateFilter::All,
             kind_filter: KindFilter::All,
@@ -317,6 +352,10 @@ impl MftApp {
             sort_asc: true,
             selected: None,
             selected_record: None,
+            selected_file: Vec::new(),
+            selected_members: Vec::new(),
+            selected_streams: Vec::new(),
+            online: online::Online::default(),
             scroll_to_row: None,
             tab: DetailTab::Summary,
             tree_open: true,
@@ -338,19 +377,12 @@ impl MftApp {
 
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
         if path.is_dir() {
-            let (pf, other) = pf::scan_folder(&path);
-            if pf.is_empty() && other.is_empty() {
-                self.status_msg = Some(format!(
-                    "Nothing to open in {}: no $MFT, $J, $Max or .pf files",
-                    path.display()
-                ));
-            }
-            for p in other {
-                self.open(p, ctx);
-            }
-            if !pf.is_empty() {
-                self.open_prefetch_batch(pf, ctx);
-            }
+            self.open_folder(path, ctx);
+            return;
+        }
+        // Checked before anything reads the whole file: images can be huge.
+        if disk::is_disk_image(&path) {
+            self.open_image(path, ctx);
             return;
         }
         let progress = Arc::new(AtomicUsize::new(0));
@@ -375,7 +407,6 @@ impl MftApp {
             total,
             rx,
         });
-        self.error = None;
     }
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
@@ -384,6 +415,9 @@ impl MftApp {
             .add_filter("Prefetch files", &["pf"])
             .pick_files()
             .unwrap_or_default();
+        if !picked.is_empty() {
+            self.begin_open();
+        }
         let (pf, other): (Vec<_>, Vec<_>) = picked.into_iter().partition(|p| {
             p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pf"))
         });
@@ -419,10 +453,9 @@ impl MftApp {
             ctx2.request_repaint();
         });
         self.loading.push(Loading { path: label, progress, total, rx });
-        self.error = None;
     }
 
-    fn poll_loading(&mut self) {
+    fn poll_loading(&mut self, ctx: &egui::Context) {
         let mut finished = Vec::new();
         self.loading.retain(|l| match l.rx.try_recv() {
             Ok(res) => {
@@ -438,26 +471,13 @@ impl MftApp {
         for (path, res) in finished {
             match res {
                 Ok(Loaded::Mft(file)) => {
-                    self.file_path = Some(path);
-                    self.file = Some(file);
-                    self.selected = None;
-                    self.selected_record = None;
-                    self.view_dirty = true;
-                    self.folder = None;
-                    self.tree_expanded = HashSet::from([ROOT_NODE]);
-                    self.tree_dirty = true;
-                    self.tree_find.clear();
-                    self.tree_hits.clear();
-                    self.history = nav::History::default();
-                    self.jv.paths_dirty = true;
-                    self.jv.dirty = true;
-                    self.pf.invalidate_links();
-                    self.mft_path_index = None;
-                    if self.journal.is_none() && self.pf.entries.is_empty() {
-                        self.active = ViewKind::Mft;
-                    }
+                    self.install_mft(path, file);
+                    self.check_volume_matches();
                 }
+                Ok(Loaded::Image(img)) => self.apply_image(path, img, ctx),
                 Ok(Loaded::Journal(j)) => {
+                    self.report_loaded(&path, format!("USN journal, {} entries", j.records.len()));
+                    self.det.dirty = true;
                     self.journal_path = Some(path);
                     self.journal = Some(j);
                     self.jv = journal::JournalView::default();
@@ -467,23 +487,47 @@ impl MftApp {
                     self.active = ViewKind::Journal;
                 }
                 Ok(Loaded::Prefetch(entries)) => {
-                    let failed: Vec<String> = entries
-                        .iter()
-                        .filter_map(|e| e.result.as_ref().err().map(|err| format!("{}: {err}", e.name())))
-                        .collect();
-                    if entries.len() == 1 && failed.len() == 1 {
-                        self.error = Some(failed[0].clone());
+                    for e in &entries {
+                        match &e.result {
+                            Ok(pf) => self.report_loaded(&e.path, format!("prefetch, run {} time{}", pf.run_count, if pf.run_count == 1 { "" } else { "s" })),
+                            Err(err) => self.report_failed(&e.path, err.clone()),
+                        }
                     }
                     self.pf.add(entries);
+                    self.det.dirty = true;
                     self.active = ViewKind::Prefetch;
                 }
                 Ok(Loaded::Max(m)) => {
+                    self.report_loaded(&path, "$Max".into());
                     self.usn_max = Some((path, m));
                     self.active = ViewKind::Journal;
                 }
-                Err(e) => self.error = Some(e),
+                Ok(Loaded::Folder(plan)) => self.apply_plan(plan, ctx),
+                Err(e) => self.report_failed(&path, e),
             }
         }
+    }
+
+    fn install_mft(&mut self, path: PathBuf, file: MftFile) {
+        self.report_loaded(&path, format!("$MFT, {} records", file.entries.len()));
+        self.file_path = Some(path);
+        self.file = Some(file);
+        self.clear_selection();
+        self.view_dirty = true;
+        self.folder = None;
+        self.tree_expanded = HashSet::from([ROOT_NODE]);
+        self.tree_dirty = true;
+        self.tree_find.clear();
+        self.tree_hits.clear();
+        self.history = nav::History::default();
+        self.jv.paths_dirty = true;
+        self.jv.dirty = true;
+        self.pf.invalidate_links();
+        self.mft_path_index = None;
+        if self.journal.is_none() && self.pf.entries.is_empty() {
+            self.active = ViewKind::Mft;
+        }
+        self.det.dirty = true;
     }
 
     fn rebuild_view(&mut self) {
@@ -498,7 +542,11 @@ impl MftApp {
             .and_then(|n| n.trim().parse::<u64>().ok());
 
         let (folder, recursive) = (self.folder, self.recursive);
+        let only = self.det.filter();
         for e in &file.entries {
+            if only.is_some_and(|f| !f.contains(&crate::detect::Target::Mft(e.record as u32))) {
+                continue;
+            }
             if let Some(f) = folder
                 && !in_folder(&file.entries, e, f, recursive) {
                     continue;
@@ -551,7 +599,18 @@ impl MftApp {
         }
         self.selected = Some(record);
         self.selected_record = self.file.as_ref().map(|f| f.parse_record(record));
+        self.selected_file = self.file.as_ref().map_or_else(Vec::new, |f| f.file_records(record));
+        self.selected_members = self.file.as_ref().map_or_else(Vec::new, |f| f.file_record_numbers(record));
+        self.selected_streams = online::StreamInfo::of_file(&self.selected_file);
         self.refresh_mft_journal_hits();
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.selected_record = None;
+        self.selected_file.clear();
+        self.selected_members.clear();
+        self.selected_streams.clear();
     }
 
     fn export_csv(&mut self) {
@@ -659,7 +718,8 @@ fn csv_escape(s: &str) -> String {
 impl eframe::App for MftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.poll_loading();
+        self.poll_loading(&ctx);
+        self.poll_jobs(&ctx);
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -668,6 +728,9 @@ impl eframe::App for MftApp {
                 .map(|f| f.path().to_path_buf())
                 .collect()
         });
+        if !dropped.is_empty() {
+            self.begin_open();
+        }
         for p in dropped {
             self.open(p, &ctx);
         }
@@ -681,9 +744,28 @@ impl eframe::App for MftApp {
         if self.jv.dirty || self.jv.paths_dirty {
             self.journal_rebuild();
         }
+        if self.det.dirty && self.loading.is_empty() {
+            self.run_detections();
+            if self.view_dirty {
+                self.rebuild_view();
+            }
+            if self.jv.dirty {
+                self.journal_rebuild();
+            }
+        }
 
+        self.online_tick(&ctx);
         self.top_bar(ui);
+        self.update_banner(ui);
+        self.detection_banner(ui);
         self.status_bar(ui);
+        self.settings_window(&ctx);
+        self.report_window(&ctx);
+        self.need_image_window(&ctx);
+        self.hash_window(&ctx);
+        self.key_prompt_window(&ctx);
+        self.confirm_upload(&ctx);
+        self.welcome_window(&ctx);
         match self.active {
             ViewKind::Mft => {
                 if self.file.is_some() {
@@ -789,6 +871,17 @@ impl MftApp {
                 {
                     self.open_dialog(ui.ctx());
                 }
+                if ui
+                    .button("📁 Open folder…")
+                    .on_hover_text(
+                        "Open a whole folder, e.g. a KAPE or Velociraptor collection: every $MFT, $J, \
+                         $Max and prefetch file inside it is found by its content, in subfolders too",
+                    )
+                    .clicked()
+                {
+                    self.open_folder_dialog(ui.ctx());
+                }
+                self.image_menu(ui);
                 let can_export = match self.active {
                     ViewKind::Mft => self.file.is_some() && !self.view.is_empty(),
                     ViewKind::Journal => self.journal.is_some(),
@@ -848,6 +941,9 @@ impl MftApp {
                         self.tree_open = !self.tree_open;
                     }
                 }
+                ui.separator();
+                self.detections_menu(ui);
+                self.help_menu(ui);
             });
             ui.add_space(2.0);
             if self.active == ViewKind::Prefetch {
@@ -912,16 +1008,19 @@ impl MftApp {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
+                self.jobs_status(ui);
                 if !self.loading.is_empty() {
                     for l in &self.loading {
                         let total = l.total.load(Ordering::Relaxed);
                         let done = l.progress.load(Ordering::Relaxed);
-                        let frac = if total == 0 { 0.0 } else { done as f32 / total as f32 };
+                        let name = l.path.file_name().unwrap_or_default().to_string_lossy();
                         ui.spinner();
-                        ui.label(format!(
-                            "Loading {}",
-                            l.path.file_name().unwrap_or_default().to_string_lossy()
-                        ));
+                        if total == 0 && l.path.is_dir() {
+                            ui.label(format!("Scanning {name}… {done} files checked"));
+                            continue;
+                        }
+                        let frac = if total == 0 { 0.0 } else { done as f32 / total as f32 };
+                        ui.label(format!("Loading {name}"));
                         ui.add(egui::ProgressBar::new(frac).show_percentage().desired_width(160.0));
                     }
                 } else if self.active == ViewKind::Prefetch {
@@ -941,9 +1040,15 @@ impl MftApp {
                 if let Some(err) = &self.error {
                     ui.separator();
                     ui.colored_label(ui.visuals().error_fg_color, err);
+                    self.report_link(ui);
+                } else if let Some(msg) = self.update_status() {
+                    ui.separator();
+                    ui.spinner();
+                    ui.label(msg);
                 } else if let Some(msg) = &self.status_msg {
                     ui.separator();
                     ui.label(msg);
+                    self.report_link(ui);
                 }
             });
         });
@@ -1024,6 +1129,7 @@ impl MftApp {
             Color32::from_rgb(20, 80, 180)
         };
         let warn_color = ui.visuals().warn_fg_color;
+        let dark = ui.visuals().dark_mode;
 
         let mut clicked: Option<usize> = None;
         let mut sort_clicked: Option<Col> = None;
@@ -1031,6 +1137,7 @@ impl MftApp {
         let mut navigate: Option<u32> = None;
         let mut reveal: Option<u32> = None;
         let mut to_journal: Option<u64> = None;
+        let mut hash_req: Option<(usize, Option<crate::intel::Service>)> = None;
         let has_journal = self.journal.is_some();
         let selected = self.selected;
         let (sort_col, sort_asc) = (self.sort_col, self.sort_asc);
@@ -1090,7 +1197,9 @@ impl MftApp {
                         for (c, _, _) in COLUMNS {
                             row.col(|ui| {
                                 let mut t = RichText::new(cell_text(e, *c));
+                                let flagged = self.det.color(crate::detect::Target::Mft(rec as u32), dark);
                                 let color = match c {
+                                    Col::Name if flagged.is_some() => flagged,
                                     Col::SiCreated if e.timestomp_suspect() => Some(warn_color),
                                     Col::Name | Col::Status | Col::Path => base_color,
                                     _ => None,
@@ -1142,6 +1251,20 @@ impl MftApp {
                                 }
                                 ui.separator();
                             }
+                            if !e.is_dir && e.valid {
+                                use crate::intel::Service;
+                                if ui.button("#️⃣ Get hashes").on_hover_text("MD5, SHA-1, SHA-224, SHA-256, SHA-384, SHA-512").clicked() {
+                                    hash_req = Some((rec, None));
+                                    ui.close();
+                                }
+                                for s in [Service::VirusTotal, Service::Triage] {
+                                    if ui.button(format!("🔎 Check on {}", s.name())).clicked() {
+                                        hash_req = Some((rec, Some(s)));
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                            }
                             if ui.button("Copy full path").clicked() {
                                 copy_text = Some(e.path.clone());
                                 ui.close();
@@ -1161,6 +1284,10 @@ impl MftApp {
                 });
         });
 
+        if let Some((r, then)) = hash_req {
+            self.select(r);
+            self.hash_file(r, then, ui.ctx());
+        }
         if let Some(t) = copy_text {
             ui.ctx().copy_text(t);
         }
@@ -1199,18 +1326,26 @@ impl MftApp {
         let mut reveal = false;
         let mut show_journal = false;
         let mut extract = false;
+        let mut jump_to: Option<usize> = None;
         let mut open_journal: Option<Option<usize>> = None;
         ui.horizontal(|ui| {
             ui.heading(format!("Record #{idx}"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 close = ui.button("✖").on_hover_text("Close details").clicked();
-                if extract::streams(rec).iter().any(|s| s.data.is_some()) {
+                if self.selected_streams.iter().any(|s| s.size > 0) {
+                    let in_mft = self.selected_streams.iter().all(|s| s.size == 0 || s.data.is_some());
+                    let hover = if in_mft {
+                        "Save the file's content (and ADS), which is stored in the $MFT".to_string()
+                    } else if self.volume.is_some() {
+                        format!("Save the file's content (and ADS), read from {}", self.volume_label)
+                    } else {
+                        "This file's content is on the volume, not in the $MFT: Sediment will ask for the \
+                         disk image it came from"
+                            .to_string()
+                    };
                     extract = ui
                         .button("📦 Extract")
-                        .on_hover_text(format!(
-                            "Save the resident $DATA content (and ADS) held in this record                              to a ZIP with the password \"{}\"",
-                            extract::PASSWORD
-                        ))
+                        .on_hover_text(format!("{hover}, to a ZIP with the password \"{}\"", extract::PASSWORD))
                         .clicked();
                 }
                 if is_tree_node(entry) {
@@ -1227,6 +1362,7 @@ impl MftApp {
         if !entry.name.is_empty() {
             ui.label(RichText::new(&entry.name).strong());
         }
+        let det_click = self.detection_links(ui, crate::detect::Target::Mft(idx as u32));
         let loaded_by = self.prefetch_users_of(idx as u64, entry.sequence);
         let mut open_pf: Option<(usize, usize)> = None;
         if !loaded_by.is_empty() {
@@ -1244,6 +1380,8 @@ impl MftApp {
             ui.selectable_value(&mut self.tab, DetailTab::Summary, "Summary");
             ui.selectable_value(&mut self.tab, DetailTab::Attributes, "Attributes");
             ui.selectable_value(&mut self.tab, DetailTab::Hex, "Hex");
+            ui.selectable_value(&mut self.tab, DetailTab::Content, "Content")
+                .on_hover_text("Hashes of the file content stored in the $MFT, with VirusTotal / Triage pivots");
             let label = if self.journal.is_some() {
                 format!("🕘 Journal ({})", self.mft_journal_hits.len())
             } else {
@@ -1256,8 +1394,11 @@ impl MftApp {
 
         match self.tab {
             DetailTab::Summary => summary_tab(ui, rec, entry, idx, file),
-            DetailTab::Attributes => attributes_tab(ui, rec),
+            DetailTab::Attributes => {
+                jump_to = attributes_tab(ui, rec, idx, &self.selected_members);
+            }
             DetailTab::Hex => hex_view(ui, &rec.data, "hex_record"),
+            DetailTab::Content => {}
             DetailTab::Journal => {
                 if let Some(i) = self.mft_journal_tab(ui, idx, rec.sequence) {
                     open_journal = Some(i);
@@ -1265,8 +1406,7 @@ impl MftApp {
             }
         }
         if close {
-            self.selected = None;
-            self.selected_record = None;
+            self.clear_selection();
         }
         if reveal {
             self.reveal_in_tree(idx as u32);
@@ -1275,7 +1415,16 @@ impl MftApp {
             open_journal = Some(None);
         }
         if extract {
-            self.extract_selected();
+            self.extract_selected(ui.ctx());
+        }
+        if let Some(r) = det_click {
+            self.set_detection(Some(detections::Active::Rule(r)));
+        }
+        if self.tab == DetailTab::Content {
+            self.content_tab(ui);
+        }
+        if let Some(r) = jump_to {
+            self.show_in_mft(r);
         }
         if let Some((p, f)) = open_pf {
             self.show_in_prefetch(p, f);
@@ -1705,32 +1854,32 @@ fn summary_tab(ui: &mut egui::Ui, rec: &Record, e: &Entry, idx: usize, file: &Mf
     });
 }
 
-impl MftApp {
-    fn extract_selected(&mut self) {
-        let (Some(rec), Some(idx)) = (&self.selected_record, self.selected) else {
-            return;
-        };
-        let Some(zip) = extract::resident_zip(rec, idx) else { return };
-        let Some(dest) = rfd::FileDialog::new()
-            .add_filter("ZIP", &["zip"])
-            .set_file_name(extract::zip_file_name(rec, idx))
-            .save_file()
-        else {
-            return;
-        };
-        self.status_msg = Some(match std::fs::write(&dest, zip) {
-            Ok(()) => format!(
-                "Extracted record #{idx} to {} (password: {})",
-                dest.display(),
-                extract::PASSWORD
-            ),
-            Err(e) => format!("Extract failed: {e}"),
-        });
-    }
-}
-
-fn attributes_tab(ui: &mut egui::Ui, rec: &Record) {
+/// Returns a record to jump to when one of the file's other records is clicked.
+fn attributes_tab(ui: &mut egui::Ui, rec: &Record, idx: usize, members: &[usize]) -> Option<usize> {
+    let mut jump = None;
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        if members.len() > 1 {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!(
+                    "This file's attributes span {} records; only #{idx} is shown here.",
+                    members.len()
+                ))
+                .on_hover_text(
+                    "When a file's attributes don't fit in one record, NTFS moves some of them \
+                     into extension records that point back to the base record. Extract and \
+                     the Content tab use all of them.",
+                );
+                for (i, &m) in members.iter().enumerate() {
+                    let label = if i == 0 { format!("#{m} (base)") } else { format!("#{m}") };
+                    if m == idx {
+                        ui.label(RichText::new(label).strong());
+                    } else if ui.small_button(label).on_hover_text("Show this record").clicked() {
+                        jump = Some(m);
+                    }
+                }
+            });
+            ui.separator();
+        }
         if rec.attributes.is_empty() {
             ui.label("No attributes (empty or invalid record).");
         }
@@ -1748,6 +1897,7 @@ fn attributes_tab(ui: &mut egui::Ui, rec: &Record) {
                 .show(ui, |ui| attribute_body(ui, rec, a, i));
         }
     });
+    jump
 }
 
 fn attribute_body(ui: &mut egui::Ui, rec: &Record, a: &mft::Attribute, i: usize) {
@@ -1903,6 +2053,46 @@ pub fn file_args() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Runs every detection over the evidence in samples/ and prints the
+    /// hit counts: `cargo test -- --ignored sample_detections --nocapture`.
+    #[test]
+    #[ignore]
+    fn sample_detections() {
+        let Ok(raw) = std::fs::read("samples/$MFT") else { return };
+        let mft = MftFile::load(raw, &AtomicUsize::new(0));
+        let mut j = UsnJournal::load(std::fs::read("samples/$J").unwrap(), &AtomicUsize::new(0));
+        journal::resolve_paths(&mut j, Some(&mft));
+        let pf = crate::prefetch::parse(&std::fs::read("samples/RUBEUS.EXE-5873E24B.pf").unwrap()).unwrap();
+        let paths = pf::build_mft_path_index(&mft);
+        let d = crate::detect::run(&crate::detect::Input {
+            mft: Some(&mft),
+            journal: Some(&j),
+            prefetch: vec![Some(&pf)],
+            prefetch_names: vec!["RUBEUS.EXE-5873E24B.pf".into()],
+            mft_paths: Some(&paths),
+        });
+        println!("{} rules, {} matched, {:?}", d.rules.len(), d.matched_rules(), d.elapsed);
+        for (r, h) in d.rules.iter().zip(&d.hits) {
+            if !h.is_empty() {
+                println!("{:>7}  {:<8} {:<52} e.g. {}", h.len(), r.severity.label(), r.name, h[0].detail);
+            }
+            if h.len() > 50 {
+                let mut c: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+                for x in h {
+                    let p = x.detail.split(" · ").next().unwrap_or("").to_lowercase();
+                    let k: Vec<&str> = p.split('\\').take(5).collect();
+                    *c.entry(k.join("\\")).or_default() += 1;
+                }
+                let mut v: Vec<_> = c.into_iter().collect();
+                v.sort_by_key(|x| std::cmp::Reverse(x.1));
+                for (k, n) in v.iter().take(6) {
+                    let eg = h.iter().find(|x| x.detail.to_lowercase().starts_with(k.as_str())).map(|x| x.detail.as_str()).unwrap_or("");
+                    println!("            {n:>5} {k}   e.g. {}", eg.split(" · ").next().unwrap_or("").rsplit('\\').next().unwrap_or(""));
+                }
+            }
+        }
+    }
     use super::*;
     use crate::fuzz_tests::{mft_seed, mutate, usn_seed, Rng, ITERS};
 

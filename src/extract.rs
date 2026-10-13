@@ -5,13 +5,18 @@
 //! ("ZipCrypto"), which every unzip tool supports and which is weak on purpose
 //! here: it is a safety wrapper, not confidentiality.
 //!
-//! Only resident content can be recovered: a non-resident stream lives in
-//! clusters on the volume, which the `$MFT` alone does not contain.
+//! A file is read from all of its records (see `MftFile::file_records`): when
+//! its attributes don't fit in one record, `$DATA` and the long name often
+//! live in an extension record. Only resident content can be recovered: a
+//! non-resident stream lives in clusters on the volume, which the `$MFT` alone
+//! does not contain.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::mft::{self, AttrBody, Record, ATTR_DATA, ATTR_FILE_NAME, ATTR_STANDARD_INFORMATION};
+use crate::ntfs;
 
 pub const PASSWORD: &str = "infected";
 
@@ -23,41 +28,52 @@ pub struct Stream<'a> {
     pub data: Option<&'a [u8]>,
 }
 
-pub fn streams(rec: &Record) -> Vec<Stream<'_>> {
-    rec.attributes
-        .iter()
-        .filter(|a| a.type_code == ATTR_DATA)
-        // A non-resident stream split over several records is listed once.
-        .filter(|a| !matches!(a.body, AttrBody::NonResident { start_vcn, .. } if start_vcn != 0))
-        .map(|a| Stream {
-            name: &a.name,
-            data: a.resident_content(&rec.data),
-        })
-        .collect()
+/// The `$DATA` streams of a file, given its records (base record first).
+pub fn streams(recs: &[Record]) -> Vec<Stream<'_>> {
+    let mut out: Vec<Stream> = Vec::new();
+    for rec in recs {
+        for a in rec.attributes.iter().filter(|a| a.type_code == ATTR_DATA) {
+            // A non-resident stream split over several records is listed once.
+            if matches!(a.body, AttrBody::NonResident { start_vcn, .. } if start_vcn != 0)
+                || out.iter().any(|s| s.name == a.name)
+            {
+                continue;
+            }
+            out.push(Stream {
+                name: &a.name,
+                data: a.resident_content(&rec.data),
+            });
+        }
+    }
+    out
 }
 
-/// The record's preferred file name (Win32 over POSIX over DOS 8.3).
-pub fn file_name(rec: &Record) -> Option<String> {
-    rec.attributes
-        .iter()
-        .filter(|a| a.type_code == ATTR_FILE_NAME)
-        .filter_map(|a| a.file_name(&rec.data))
+/// The file's preferred name (Win32 over POSIX over DOS 8.3).
+pub fn file_name(recs: &[Record]) -> Option<String> {
+    recs.iter()
+        .flat_map(|r| {
+            r.attributes
+                .iter()
+                .filter(|a| a.type_code == ATTR_FILE_NAME)
+                .filter_map(|a| a.file_name(&r.data))
+        })
         .max_by_key(|f| mft::namespace_rank(f.namespace))
         .map(|f| f.name)
 }
 
-/// Builds the encrypted archive of every resident `$DATA` stream in `rec`.
-/// Returns `None` when there is nothing resident to extract.
-pub fn resident_zip(rec: &Record, record_no: usize) -> Option<Vec<u8>> {
-    let base = file_name(rec)
+/// Builds the encrypted archive of every resident `$DATA` stream of the file
+/// made of `recs`. Returns `None` when there is nothing resident to extract.
+#[cfg(test)]
+pub fn resident_zip(recs: &[Record], record_no: usize) -> Option<Vec<u8>> {
+    let base = file_name(recs)
         .map(|n| sanitize(&n))
         .unwrap_or_else(|| format!("record_{record_no}"));
-    let modified = rec
-        .attributes
+    let modified = recs
         .iter()
-        .find_map(|a| (a.type_code == ATTR_STANDARD_INFORMATION).then(|| a.standard_info(&rec.data))?)
+        .flat_map(|r| r.attributes.iter().map(move |a| (r, a)))
+        .find_map(|(r, a)| (a.type_code == ATTR_STANDARD_INFORMATION).then(|| a.standard_info(&r.data))?)
         .map_or(0, |si| si.times.modified);
-    let files: Vec<ZipFile> = streams(rec)
+    let files: Vec<ZipFile> = streams(recs)
         .into_iter()
         .filter_map(|s| {
             let name = if s.name.is_empty() {
@@ -71,9 +87,117 @@ pub fn resident_zip(rec: &Record, record_no: usize) -> Option<Vec<u8>> {
     (!files.is_empty()).then(|| encrypted_zip(&files, PASSWORD.as_bytes()))
 }
 
-/// Default name offered for the archive.
-pub fn zip_file_name(rec: &Record, record_no: usize) -> String {
-    match file_name(rec) {
+/// What `extract_to` wrote.
+pub struct Extracted {
+    pub files: usize,
+    pub bytes: u64,
+    /// Streams left out, with the reason.
+    pub skipped: Vec<String>,
+}
+
+/// Total size of what `extract_to` would write, for progress.
+pub fn extract_size(recs: &[Record], vol: Option<&ntfs::Volume>) -> u64 {
+    streams(recs)
+        .iter()
+        .filter(|s| s.data.is_some() || vol.is_some())
+        .filter_map(|s| ntfs::content_size(recs, s.name))
+        .sum()
+}
+
+/// Writes every `$DATA` stream of the file made of `recs` to an encrypted
+/// ZIP at `dest`. Content in the record needs nothing else; content in
+/// clusters is read from `vol`, the volume the `$MFT` came from. The archive
+/// is written next to `dest` and only renamed into place once complete.
+pub fn extract_to(
+    dest: &std::path::Path,
+    recs: &[Record],
+    record_no: usize,
+    vol: Option<&ntfs::Volume>,
+    progress: &AtomicU64,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Extracted, String> {
+    let base = file_name(recs)
+        .map(|n| sanitize(&n))
+        .unwrap_or_else(|| format!("record_{record_no}"));
+    let modified = recs
+        .iter()
+        .flat_map(|r| r.attributes.iter().map(move |a| (r, a)))
+        .find_map(|(r, a)| (a.type_code == ATTR_STANDARD_INFORMATION).then(|| a.standard_info(&r.data))?)
+        .map_or(0, |si| si.times.modified);
+    let wof = matches!(ntfs::kind(recs, ""), Some(ntfs::Kind::Wof));
+
+    let tmp = dest.with_extension("zip.partial");
+    let file = std::fs::File::create(&tmp).map_err(|e| format!("couldn't create {}: {e}", tmp.display()))?;
+    let mut zip = ZipWriter::new(std::io::BufWriter::with_capacity(1 << 20, file), PASSWORD.as_bytes());
+    let mut out = Extracted { files: 0, bytes: 0, skipped: Vec::new() };
+    let result = (|| -> Result<(), String> {
+        for s in streams(recs) {
+            let label = if s.name.is_empty() { "main stream".to_string() } else { format!("stream {:?}", s.name) };
+            // WOF content is read through the main stream, decompressed.
+            if wof && s.name == "WofCompressedData" {
+                continue;
+            }
+            let kind = ntfs::kind(recs, s.name);
+            let mut name = if s.name.is_empty() { base.clone() } else { format!("{base}_{}", sanitize(s.name)) };
+            if matches!(kind, Some(ntfs::Kind::Encrypted)) {
+                name.push_str(".efs-encrypted");
+            }
+            let Some(size) = ntfs::content_size(recs, s.name) else {
+                out.skipped.push(format!("{label}: no data"));
+                continue;
+            };
+            match (s.data, vol) {
+                (Some(d), _) if !(wof && s.name.is_empty()) => {
+                    zip.add(&name, modified, d).map_err(|e| e.to_string())?;
+                    progress.fetch_add(d.len() as u64, Ordering::Relaxed);
+                }
+                (_, Some(vol)) => {
+                    let local = AtomicU64::new(0);
+                    zip.add_stream(&name, modified, size, |e| {
+                        ntfs::read_content(vol, recs, s.name, &mut |b| {
+                            if cancel.load(Ordering::Relaxed) {
+                                return Err("cancelled".into());
+                            }
+                            progress.fetch_add(b.len() as u64, Ordering::Relaxed);
+                            e.write(b).map_err(|x| format!("couldn't write the archive: {x}"))
+                        }, &local)
+                        .map_err(|err| std::io::Error::other(format!("{label}: {err}")))
+                    })
+                    .map_err(|e| e.to_string())?;
+                }
+                (_, None) => {
+                    out.skipped.push(format!(
+                        "{label} ({size} bytes): its content is on the volume, not in the $MFT; open the disk image to extract it"
+                    ));
+                    continue;
+                }
+            }
+            out.files += 1;
+            out.bytes += size;
+        }
+        Ok(())
+    })();
+    let finished = result.and_then(|()| zip.finish().map_err(|e| e.to_string()));
+    match finished {
+        Ok(_) if out.files == 0 => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(out.skipped.first().cloned().unwrap_or_else(|| "nothing to extract".into()))
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(dest);
+            std::fs::rename(&tmp, dest).map_err(|e| format!("couldn't save {}: {e}", dest.display()))?;
+            Ok(out)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+// Default name offered for the archive.
+pub fn zip_file_name(recs: &[Record], record_no: usize) -> String {
+    match file_name(recs) {
         Some(n) => format!("record_{record_no}_{}.zip", sanitize(&n)),
         None => format!("record_{record_no}.zip"),
     }
@@ -97,6 +221,7 @@ fn sanitize(name: &str) -> String {
 
 // ---------------------------------------------------------------- zip writer
 
+#[cfg(test)]
 pub struct ZipFile<'a> {
     pub name: String,
     pub data: &'a [u8],
@@ -106,65 +231,235 @@ pub struct ZipFile<'a> {
 
 /// Writes a ZIP of stored (uncompressed) entries, each encrypted with
 /// traditional PKWARE encryption (APPNOTE 6.1).
+#[cfg(test)]
 pub fn encrypted_zip(files: &[ZipFile], password: &[u8]) -> Vec<u8> {
-    const FLAGS: u16 = 0x0001 | 0x0800; // encrypted, UTF-8 names
-    let mut out = Vec::new();
-    let mut central = Vec::new();
-    let mut rng = HeaderRng::new();
-
+    let mut z = ZipWriter::new(Vec::new(), password);
     for f in files {
-        let crc = crc32(f.data);
-        let (time, date) = dos_datetime(f.modified);
-        let name = f.name.as_bytes();
-        let stored = f.data.len() as u32 + 12;
-        let offset = out.len() as u32;
+        z.add(&f.name, f.modified, f.data).expect("writing to memory");
+    }
+    z.finish().expect("writing to memory")
+}
 
-        let mut common = Vec::new();
-        put16(&mut common, 20); // version needed
-        put16(&mut common, FLAGS);
-        put16(&mut common, 0); // stored
-        put16(&mut common, time);
-        put16(&mut common, date);
-        put32(&mut common, crc);
-        put32(&mut common, stored);
-        put32(&mut common, f.data.len() as u32);
-        put16(&mut common, name.len() as u16);
-        put16(&mut common, 0); // extra length
+const FLAG_ENCRYPTED: u16 = 0x0001;
+const FLAG_DESCRIPTOR: u16 = 0x0008;
+const FLAG_UTF8: u16 = 0x0800;
+const U32_MAX: u64 = 0xFFFF_FFFF;
 
-        put32(&mut out, 0x0403_4B50);
-        out.extend_from_slice(&common);
-        out.extend_from_slice(name);
+/// Streams encrypted, stored entries to `out`, so files larger than memory
+/// can be archived. Entries whose content is known up front get their CRC in
+/// the local header; streamed ones use a data descriptor. ZIP64 is used where
+/// sizes or offsets don't fit in 32 bits.
+pub struct ZipWriter<W: std::io::Write> {
+    out: W,
+    pos: u64,
+    central: Vec<u8>,
+    count: u64,
+    password: Vec<u8>,
+    rng: HeaderRng,
+    /// Sizes and offsets from here on use ZIP64 fields (lowered by tests).
+    limit: u64,
+}
 
-        // 12-byte encryption header: random, last byte checks the password.
-        let mut keys = Keys::new(password);
-        let mut header = [0u8; 12];
-        rng.fill(&mut header[..11]);
-        header[11] = (crc >> 24) as u8;
-        out.extend(header.iter().map(|&b| keys.encrypt(b)));
-        out.extend(f.data.iter().map(|&b| keys.encrypt(b)));
+/// The open entry of a `ZipWriter::add_stream`.
+pub struct EntryWriter<'a, W: std::io::Write> {
+    zip: &'a mut ZipWriter<W>,
+    keys: Keys,
+    crc: u32,
+    written: u64,
+    buf: Vec<u8>,
+}
 
-        put32(&mut central, 0x0201_4B50);
-        put16(&mut central, 20); // version made by
-        central.extend_from_slice(&common);
-        put16(&mut central, 0); // comment length
-        put16(&mut central, 0); // disk
-        put16(&mut central, 0); // internal attributes
-        put32(&mut central, 0); // external attributes
-        put32(&mut central, offset);
-        central.extend_from_slice(name);
+impl<W: std::io::Write> EntryWriter<'_, W> {
+    pub fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.crc = !data.iter().fold(!self.crc, |c, &b| crc_step(c, b));
+        self.buf.clear();
+        self.buf.extend(data.iter().map(|&b| self.keys.encrypt(b)));
+        self.zip.out.write_all(&self.buf)?;
+        self.zip.pos += data.len() as u64;
+        self.written += data.len() as u64;
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> ZipWriter<W> {
+    pub fn new(out: W, password: &[u8]) -> Self {
+        ZipWriter { out, pos: 0, central: Vec::new(), count: 0, password: password.to_vec(), rng: HeaderRng::new(), limit: U32_MAX }
     }
 
-    let cd_offset = out.len() as u32;
-    out.extend_from_slice(&central);
-    put32(&mut out, 0x0605_4B50);
-    put16(&mut out, 0);
-    put16(&mut out, 0);
-    put16(&mut out, files.len() as u16);
-    put16(&mut out, files.len() as u16);
-    put32(&mut out, central.len() as u32);
-    put32(&mut out, cd_offset);
-    put16(&mut out, 0);
-    out
+    fn put(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.out.write_all(bytes)?;
+        self.pos += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Adds an entry whose content is in memory.
+    pub fn add(&mut self, name: &str, modified: u64, data: &[u8]) -> std::io::Result<()> {
+        let crc = crc32(data);
+        self.entry(name, modified, data.len() as u64, Some(crc), |e| e.write(data))
+    }
+
+    /// Adds an entry of `size` bytes produced by `fill`, which may hand over
+    /// the content in pieces.
+    pub fn add_stream(
+        &mut self,
+        name: &str,
+        modified: u64,
+        size: u64,
+        fill: impl FnOnce(&mut EntryWriter<W>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        self.entry(name, modified, size, None, fill)
+    }
+
+    fn entry(
+        &mut self,
+        name: &str,
+        modified: u64,
+        size: u64,
+        crc: Option<u32>,
+        fill: impl FnOnce(&mut EntryWriter<W>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let (time, date) = dos_datetime(modified);
+        let name_bytes = name.as_bytes();
+        let offset = self.pos;
+        let stored = size + 12;
+        let zip64 = stored >= self.limit;
+        let far = offset >= self.limit;
+        let flags = FLAG_ENCRYPTED | FLAG_UTF8 | if crc.is_none() { FLAG_DESCRIPTOR } else { 0 };
+        let version: u16 = if zip64 || far { 45 } else { 20 };
+
+        let mut local = Vec::new();
+        put32(&mut local, 0x0403_4B50);
+        put16(&mut local, version);
+        put16(&mut local, flags);
+        put16(&mut local, 0); // stored
+        put16(&mut local, time);
+        put16(&mut local, date);
+        put32(&mut local, crc.unwrap_or(0));
+        if zip64 {
+            put32(&mut local, U32_MAX as u32);
+            put32(&mut local, U32_MAX as u32);
+        } else {
+            put32(&mut local, if crc.is_some() { stored as u32 } else { 0 });
+            put32(&mut local, if crc.is_some() { size as u32 } else { 0 });
+        }
+        put16(&mut local, name_bytes.len() as u16);
+        put16(&mut local, if zip64 { 20 } else { 0 });
+        local.extend_from_slice(name_bytes);
+        if zip64 {
+            put16(&mut local, 0x0001);
+            put16(&mut local, 16);
+            let known = if crc.is_some() { (size, stored) } else { (0, 0) };
+            local.extend_from_slice(&known.0.to_le_bytes());
+            local.extend_from_slice(&known.1.to_le_bytes());
+        }
+        self.put(&local)?;
+
+        // 12-byte encryption header; its last byte lets unzip tools check the
+        // password: the CRC's high byte, or the time's when the CRC comes later.
+        let mut keys = Keys::new(&self.password);
+        let mut header = [0u8; 12];
+        self.rng.fill(&mut header[..11]);
+        header[11] = match crc {
+            Some(c) => (c >> 24) as u8,
+            None => (time >> 8) as u8,
+        };
+        let enc: Vec<u8> = header.iter().map(|&b| keys.encrypt(b)).collect();
+        self.put(&enc)?;
+
+        let mut e = EntryWriter { zip: self, keys, crc: 0, written: 0, buf: Vec::new() };
+        fill(&mut e)?;
+        let (actual_crc, written) = (e.crc, e.written);
+        if written != size {
+            return Err(std::io::Error::other(format!("{name}: expected {size} bytes, got {written}")));
+        }
+        if crc.is_none() {
+            let mut d = Vec::new();
+            put32(&mut d, 0x0807_4B50);
+            put32(&mut d, actual_crc);
+            if zip64 {
+                d.extend_from_slice(&stored.to_le_bytes());
+                d.extend_from_slice(&size.to_le_bytes());
+            } else {
+                put32(&mut d, stored as u32);
+                put32(&mut d, size as u32);
+            }
+            self.put(&d)?;
+        }
+
+        let mut extra = Vec::new();
+        if zip64 {
+            extra.extend_from_slice(&size.to_le_bytes());
+            extra.extend_from_slice(&stored.to_le_bytes());
+        }
+        if far {
+            extra.extend_from_slice(&offset.to_le_bytes());
+        }
+        let c = &mut self.central;
+        put32(c, 0x0201_4B50);
+        put16(c, version); // made by
+        put16(c, version); // needed
+        put16(c, flags);
+        put16(c, 0);
+        put16(c, time);
+        put16(c, date);
+        put32(c, actual_crc);
+        put32(c, if zip64 { U32_MAX as u32 } else { stored as u32 });
+        put32(c, if zip64 { U32_MAX as u32 } else { size as u32 });
+        put16(c, name_bytes.len() as u16);
+        put16(c, if extra.is_empty() { 0 } else { extra.len() as u16 + 4 });
+        put16(c, 0); // comment
+        put16(c, 0); // disk
+        put16(c, 0); // internal attributes
+        put32(c, 0); // external attributes
+        put32(c, if far { U32_MAX as u32 } else { offset as u32 });
+        c.extend_from_slice(name_bytes);
+        if !extra.is_empty() {
+            put16(c, 0x0001);
+            put16(c, extra.len() as u16);
+            c.extend_from_slice(&extra);
+        }
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Writes the central directory and returns the underlying writer.
+    pub fn finish(mut self) -> std::io::Result<W> {
+        let cd_offset = self.pos;
+        let central = std::mem::take(&mut self.central);
+        self.put(&central)?;
+        let cd_size = central.len() as u64;
+        let zip64 = self.count >= 0xFFFF || cd_offset >= self.limit || cd_size >= self.limit;
+        let mut end = Vec::new();
+        if zip64 {
+            let record_at = self.pos;
+            put32(&mut end, 0x0606_4B50);
+            end.extend_from_slice(&44u64.to_le_bytes());
+            put16(&mut end, 45);
+            put16(&mut end, 45);
+            put32(&mut end, 0);
+            put32(&mut end, 0);
+            end.extend_from_slice(&self.count.to_le_bytes());
+            end.extend_from_slice(&self.count.to_le_bytes());
+            end.extend_from_slice(&cd_size.to_le_bytes());
+            end.extend_from_slice(&cd_offset.to_le_bytes());
+            put32(&mut end, 0x0706_4B50);
+            put32(&mut end, 0);
+            end.extend_from_slice(&record_at.to_le_bytes());
+            put32(&mut end, 1);
+        }
+        put32(&mut end, 0x0605_4B50);
+        put16(&mut end, 0);
+        put16(&mut end, 0);
+        let n = if zip64 { 0xFFFF } else { self.count as u16 };
+        put16(&mut end, n);
+        put16(&mut end, n);
+        put32(&mut end, if zip64 { U32_MAX as u32 } else { cd_size as u32 });
+        put32(&mut end, if zip64 { U32_MAX as u32 } else { cd_offset as u32 });
+        put16(&mut end, 0);
+        self.put(&end)?;
+        self.out.flush()?;
+        Ok(self.out)
+    }
 }
 
 fn put16(v: &mut Vec<u8>, x: u16) {
@@ -276,61 +571,77 @@ fn dos_datetime(ft: u64) -> (u16, u16) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::mft::u32_at;
+    use crate::mft::{u32_at, MftFile};
+    use std::sync::atomic::AtomicUsize;
 
     /// Builds a 1024-byte FILE record for `readme.txt` holding `content` as
     /// resident `$DATA` plus a `Zone.Identifier` ADS, with valid fixups.
     pub(crate) fn fake_record(content: &[u8]) -> Vec<u8> {
-        fn resident(type_code: u32, name: &str, id: u16, content: &[u8]) -> Vec<u8> {
-            let name16: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
-            let content_off = (24 + name16.len()).next_multiple_of(8);
-            let len = (content_off + content.len()).next_multiple_of(8);
-            let mut a = vec![0u8; len];
-            a[0..4].copy_from_slice(&type_code.to_le_bytes());
-            a[4..8].copy_from_slice(&(len as u32).to_le_bytes());
-            a[9] = name.encode_utf16().count() as u8;
-            a[10..12].copy_from_slice(&24u16.to_le_bytes());
-            a[14..16].copy_from_slice(&id.to_le_bytes());
-            a[16..20].copy_from_slice(&(content.len() as u32).to_le_bytes());
-            a[20..22].copy_from_slice(&(content_off as u16).to_le_bytes());
-            a[24..24 + name16.len()].copy_from_slice(&name16);
-            a[content_off..content_off + content.len()].copy_from_slice(content);
-            a
-        }
-        let ft: u64 = 0x01DC_1B84_9F82_04B6; // 2025-09-01 21:08:54
+        let attrs = [
+            resident(0x10, "", 0, &std_info()),
+            resident(0x30, "", 1, &file_name_attr("readme.txt", 3, content.len())),
+            resident(0x80, "", 2, content),
+            resident(0x80, "Zone.Identifier", 3, b"[ZoneTransfer]\r\nZoneId=3\r\n"),
+        ];
+        build_record(1, 1, 0, &attrs.concat())
+    }
+
+    pub(crate) fn resident(type_code: u32, name: &str, id: u16, content: &[u8]) -> Vec<u8> {
+        let name16: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let content_off = (24 + name16.len()).next_multiple_of(8);
+        let len = (content_off + content.len()).next_multiple_of(8);
+        let mut a = vec![0u8; len];
+        a[0..4].copy_from_slice(&type_code.to_le_bytes());
+        a[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+        a[9] = name.encode_utf16().count() as u8;
+        a[10..12].copy_from_slice(&24u16.to_le_bytes());
+        a[14..16].copy_from_slice(&id.to_le_bytes());
+        a[16..20].copy_from_slice(&(content.len() as u32).to_le_bytes());
+        a[20..22].copy_from_slice(&(content_off as u16).to_le_bytes());
+        a[24..24 + name16.len()].copy_from_slice(&name16);
+        a[content_off..content_off + content.len()].copy_from_slice(content);
+        a
+    }
+
+    /// `$STANDARD_INFORMATION` content with every time 2025-09-01 21:08:54.
+    pub(crate) fn std_info() -> Vec<u8> {
+        let ft: u64 = 0x01DC_1B84_9F82_04B6;
         let mut si = vec![0u8; 72];
         for i in 0..4 {
             si[i * 8..i * 8 + 8].copy_from_slice(&ft.to_le_bytes());
         }
         si[32] = 0x20; // archive
-        let name: Vec<u8> = "readme.txt".encode_utf16().flat_map(u16::to_le_bytes).collect();
-        let mut fname = vec![0u8; 66];
-        fname[0..8].copy_from_slice(&5u64.to_le_bytes()); // parent: root
-        fname[48..56].copy_from_slice(&(content.len() as u64).to_le_bytes());
-        fname[64] = 10;
-        fname[65] = 3; // Win32 & DOS
-        fname.extend_from_slice(&name);
+        si
+    }
 
-        let mut attrs = Vec::new();
-        attrs.extend(resident(0x10, "", 0, &si));
-        attrs.extend(resident(0x30, "", 1, &fname));
-        attrs.extend(resident(0x80, "", 2, content));
-        attrs.extend(resident(0x80, "Zone.Identifier", 3, b"[ZoneTransfer]\r\nZoneId=3\r\n"));
-        attrs.extend(0xFFFF_FFFFu32.to_le_bytes());
-        attrs.extend([0u8; 4]);
+    /// `$FILE_NAME` content for `name` in the root folder.
+    pub(crate) fn file_name_attr(name: &str, namespace: u8, size: usize) -> Vec<u8> {
+        let mut f = vec![0u8; 66];
+        f[0..8].copy_from_slice(&5u64.to_le_bytes()); // parent: root
+        f[48..56].copy_from_slice(&(size as u64).to_le_bytes());
+        f[64] = name.encode_utf16().count() as u8;
+        f[65] = namespace;
+        f.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+        f
+    }
 
+    /// A 1024-byte FILE record holding `attrs`, with valid fixups. `base` is
+    /// the base record reference of an extension record, 0 otherwise.
+    pub(crate) fn build_record(sequence: u16, flags: u16, base: u64, attrs: &[u8]) -> Vec<u8> {
         let mut r = vec![0u8; 1024];
         r[0..4].copy_from_slice(b"FILE");
         r[4..6].copy_from_slice(&48u16.to_le_bytes()); // update sequence offset
         r[6..8].copy_from_slice(&3u16.to_le_bytes()); // 1 + one per sector
-        r[16..18].copy_from_slice(&1u16.to_le_bytes()); // sequence
+        r[16..18].copy_from_slice(&sequence.to_le_bytes());
         r[18..20].copy_from_slice(&1u16.to_le_bytes()); // link count
         r[20..22].copy_from_slice(&56u16.to_le_bytes()); // first attribute
-        r[22..24].copy_from_slice(&1u16.to_le_bytes()); // in use
-        r[24..28].copy_from_slice(&((56 + attrs.len()) as u32).to_le_bytes());
+        r[22..24].copy_from_slice(&flags.to_le_bytes());
+        r[24..28].copy_from_slice(&((56 + attrs.len() + 8) as u32).to_le_bytes());
         r[28..32].copy_from_slice(&1024u32.to_le_bytes());
-        r[40..42].copy_from_slice(&4u16.to_le_bytes()); // next attribute id
-        r[56..56 + attrs.len()].copy_from_slice(&attrs);
+        r[32..40].copy_from_slice(&base.to_le_bytes());
+        r[40..42].copy_from_slice(&8u16.to_le_bytes()); // next attribute id
+        r[56..56 + attrs.len()].copy_from_slice(attrs);
+        r[56 + attrs.len()..60 + attrs.len()].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         // Fixups: save each sector's last two bytes, stamp the check value.
         let usn = [0x07, 0x00];
         r[48..50].copy_from_slice(&usn);
@@ -374,8 +685,8 @@ pub(crate) mod tests {
     #[test]
     fn extracts_resident_data_from_fake_record() {
         let content = b"Hello from a fake MFT record. Nothing to see here.\r\n";
-        let rec = Record::parse(&fake_record(content));
-        assert!(rec.is_valid() && rec.fixup_ok);
+        let rec = [Record::parse(&fake_record(content))];
+        assert!(rec[0].is_valid() && rec[0].fixup_ok);
         assert_eq!(file_name(&rec).as_deref(), Some("readme.txt"));
         let s = streams(&rec);
         assert_eq!(s.len(), 2);
@@ -402,8 +713,79 @@ pub(crate) mod tests {
         // End the attribute list right after $FN.
         let data_off = Record::parse(&raw).attributes[2].offset;
         raw[data_off..data_off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        let rec = Record::parse(&raw);
-        assert!(resident_zip(&rec, 1).is_none());
+        assert!(resident_zip(&[Record::parse(&raw)], 1).is_none());
+    }
+
+    #[test]
+    fn extracts_from_extension_records() {
+        let file_ref = |n: u64, seq: u16| n | (seq as u64) << 48;
+        let base = |seq, flags| {
+            let attrs = [
+                resident(0x10, "", 0, &std_info()),
+                resident(0x30, "", 1, &file_name_attr("NEWSAP~1.PNG", 2, 0)),
+            ];
+            build_record(seq, flags, 0, &attrs.concat())
+        };
+        let ext = |base: u64, name: &str, body: &[u8]| {
+            let attrs = [
+                resident(0x30, "", 0, &file_name_attr(name, 1, body.len())),
+                resident(0x80, "", 1, body),
+            ];
+            build_record(1, 1, base, &attrs.concat())
+        };
+        let data = b"PNG data that ended up in an extension record";
+        let mft = [
+            fake_record(b"x"),
+            // #1 holds only the 8.3 name; #2 has the long name and the data.
+            base(3, 1),
+            ext(file_ref(1, 3), "newsapp.png", data),
+            // Left over from an earlier file in #1.
+            ext(file_ref(1, 2), "old.txt", b"STALE"),
+            // A deleted file: NTFS bumped #4's sequence number when it freed it.
+            base(5, 0),
+            ext(file_ref(4, 4), "gone.txt", b"deleted but still here"),
+        ]
+        .concat();
+        let f = MftFile::load(mft, &AtomicUsize::new(0));
+
+        // The base record and its extension record give the same file.
+        for i in [1, 2] {
+            let recs = f.file_records(i);
+            assert_eq!(recs.len(), 2);
+            assert_eq!(file_name(&recs).as_deref(), Some("newsapp.png"));
+            assert_eq!(zip_file_name(&recs, 1), "record_1_newsapp.png.zip");
+            let files = read_zip(&resident_zip(&recs, 1).unwrap(), PASSWORD.as_bytes());
+            assert_eq!(files, [("newsapp.png".to_string(), data.to_vec())]);
+        }
+        assert_eq!(f.file_records(3).len(), 1);
+
+        let deleted = f.file_records(4);
+        assert_eq!(deleted.len(), 2);
+        let files = read_zip(&resident_zip(&deleted, 4).unwrap(), PASSWORD.as_bytes());
+        assert_eq!(files, [("gone.txt".to_string(), b"deleted but still here".to_vec())]);
+    }
+
+    /// Writes archives in every layout for checking with an external tool:
+    /// `cargo test -- --ignored dump_zip_layouts`, then unzip them with the password.
+    #[test]
+    #[ignore]
+    fn dump_zip_layouts() {
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 253) as u8).collect();
+        for (name, limit) in [("plain", U32_MAX), ("zip64", 0)] {
+            let mut z = ZipWriter::new(Vec::new(), PASSWORD.as_bytes());
+            z.limit = limit;
+            z.add("known.bin", 0x01DC_1B84_9F82_04B6, &data[..1000]).unwrap();
+            z.add_stream("streamed.bin", 0x01DC_1B84_9F82_04B6, data.len() as u64, |e| {
+                for c in data.chunks(65536) {
+                    e.write(c)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            let path = std::env::temp_dir().join(format!("sediment-{name}.zip"));
+            std::fs::write(&path, z.finish().unwrap()).unwrap();
+            println!("{}", path.display());
+        }
     }
 
     /// Writes the fake record's archive for checking with an external tool, and
@@ -412,14 +794,13 @@ pub(crate) mod tests {
     #[test]
     #[ignore]
     fn dump_fake_record_zip() {
-        let rec = Record::parse(&fake_record(b"Hello from a fake MFT record.\r\n"));
+        let rec = [Record::parse(&fake_record(b"Hello from a fake MFT record.\r\n"))];
         let path = std::env::temp_dir().join(zip_file_name(&rec, 42));
         std::fs::write(&path, resident_zip(&rec, 42).unwrap()).unwrap();
         println!("{}", path.display());
         // The same record as a one-record $MFT, to try the Extract button.
         let mft = std::env::temp_dir().join("fake_MFT");
-        std::fs::write(&mft, fake_record(b"Hello from a fake MFT record.
-")).unwrap();
+        std::fs::write(&mft, fake_record(b"Hello from a fake MFT record.\r\n")).unwrap();
         println!("{}", mft.display());
     }
 }

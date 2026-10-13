@@ -2,104 +2,94 @@
 
 *Every action leaves a layer.*
 
-A desktop explorer for Windows forensic artifacts, with the links between them:
+Sediment is a desktop app for investigating Windows machines. Open a triage collection or a
+disk image and see what was on the drive, what changed, and what ran, linked together,
+with built-in detections mapped to MITRE ATT&CK.
 
-| Artifact | What you get |
-|---|---|
-| **`$MFT`** | Folder tree rebuilt from parent references, deleted entries, hard links, every attribute decoded (`$SI` / `$FN` timestamps, data runs, ADS, raw hex), timestomping flag, resident file content (and ADS) extracted to a ZIP with the password `infected` |
-| **`$UsnJrnl:$J`** + **`$Max`** | Change journal as a table and as a folder tree with activity / deletion counts, full paths resolved through the `$MFT` (or the journal itself for folders that no longer exist) |
-| **Prefetch (`.pf`)** | Run count and times, loaded files, directories, volumes, trace chains, known attacker tools, capability hints, notable files |
+Free for small teams · Windows, macOS and Linux · runs entirely on your machine
 
-Cross-artifact links:
-
-- **MFT ↔ Journal**: every MFT record has a Journal tab; every journal entry links back to its MFT record.
-- **Prefetch → MFT / Journal**: each loaded file shows whether it still exists in the `$MFT` (by MFT reference, or by path on Windows 10+, where prefetch no longer stores per-file references), with one-click jumps to the record and its journal history. The `.pf` file's own creation in the journal gives a first-run estimate.
-- **MFT → Prefetch**: an MFT record shows which prefetch files loaded it.
-- **Back / Forward** across all views (Alt+← / Alt+→, mouse side buttons).
-
-Files are recognised by content, so names don't matter. Drop files or whole folders
-(e.g. a KAPE triage folder or `C:\Windows\Prefetch`) onto the window, or pass them
-on the command line:
-
-```
-sediment $MFT $J $Max C:\cases\host1\Prefetch
-```
+![Sediment](docs/assets/cover.png)
 
 ## Install
 
-One command, no administrator rights. Details and screenshots: <https://nyanites.github.io/sediment/>
+One command, no administrator rights:
 
-**Windows** (PowerShell):
+**Windows** (PowerShell)
 
 ```powershell
 irm https://nyanites.github.io/sediment/install.ps1 | iex
 ```
 
-**macOS and Linux** (terminal):
+**macOS and Linux** (Terminal)
 
 ```sh
 curl -fsSL https://nyanites.github.io/sediment/install.sh | sh
 ```
 
-The installers ([install.ps1](docs/install.ps1), [install.sh](docs/install.sh)) download the
-latest [release](https://github.com/Nyanites/sediment/releases), verify it against the
-published SHA-256 checksums, and install for the current user only: Windows to
-`%LOCALAPPDATA%\Programs\Sediment` (Start menu shortcut, added to PATH), macOS to
-`/Applications/Sediment.app`, Linux to `~/.local/bin/sediment` (app-menu entry). Release
-binaries carry [build provenance attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations):
-`gh attestation verify <file> -R Nyanites/sediment`.
+The installer downloads the latest [release](https://github.com/Nyanites/sediment/releases),
+checks it against its published checksum and installs it for your user. Sediment then keeps
+itself up to date (Help → Check for updates).
 
-## Platforms
+## What it does
 
-Windows, macOS and Linux. Everything is plain Rust + [egui](https://github.com/emilk/egui);
-Windows 10+ prefetch decompression (Xpress Huffman, [MS-XCA] §2.2) is implemented in
-`src/xpress.rs` rather than through `ntdll`, so it works everywhere.
+**Detections, mapped to ATT&CK.** Built-in rules flag attacker tools, credential theft,
+timestomping, persistence, log tampering, ransomware-style mass renames and more. The
+🛡 Detections menu groups them by tactic and severity; pick one to jump straight to every
+hit, with what the rule checks, likely false positives and references.
 
-## Building
+**Files and folders, including deleted ones.** Browse the drive's folder tree from its
+`$MFT` like File Explorer, deleted entries included, with every detail of every file:
+timestamps, alternate data streams, hard links and timestomping signs.
+
+**Every change, over time.** The USN change journal as a timeline and as a folder tree of
+where activity happened, with the full history of any file: created, renamed, changed,
+deleted.
+
+**What ran, and what it could do.** Prefetch shows run counts and times, with known attacker
+tools named and capabilities read from the libraries a program loaded.
+
+**Connected.** Jump from a program that ran, to the files it loaded, to everything that
+happened to them, and back.
+
+**Hash and check.** Right-click a file for its MD5, SHA-1 and SHA-256 to SHA-512, and check
+it on VirusTotal or Triage with your own API keys.
+
+**Extract safely.** Save any file, even a deleted one, into a ZIP locked with the password
+`infected`. Small files come straight out of the `$MFT`; open the disk image (E01 or raw/dd)
+and files of any size come out.
+
+## Getting started
+
+- **Open a collection:** Open folder… (or drag it onto the window). Sediment finds the
+  `$MFT`, `$J`, `$Max` and prefetch files inside it by their content, in subfolders too.
+- **Open a disk image:** 🖴 Image → Open disk image… (E01 or raw/dd). Its `$MFT` is loaded
+  and every file can be hashed and extracted.
+- **From the command line:** `sediment $MFT $J $Max C:\cases\host1\Prefetch`
+- **Check hashes online:** add your VirusTotal or Triage API key when asked, or any time in
+  Help → Settings.
+
+Any file that can't be read is listed in the load report (Details… in the status bar);
+everything else still loads.
+
+## Privacy
+
+Your evidence never leaves your machine unless you send it. Sediment checks GitHub once a day
+for a new version (you can turn this off in Help → Settings), and contacts VirusTotal or
+Triage only when you click a check or submit button. Submissions always ask first. There is
+no telemetry and no account.
+
+## Build from source
 
 ```
-cargo build --release      # target/release/sediment(.exe)
-cargo test --release       # parser tests use the files in samples/ when present
-```
-
-`cargo test -- --ignored live_prefetch_dir` additionally decodes every file in
-`C:\Windows\Prefetch` with both our decoder and Windows' own (run as administrator).
-
-`samples/` holds evidence files for the tests and is not committed. The tests that
-need them skip themselves when it is absent. `tests/fixtures/` is committed and always
-runs: data compressed by Windows' own Xpress Huffman encoder, plus a small synthetic
-Windows 10 prefetch file, so every platform is checked against real Windows output.
-Regenerate them on Windows with `cargo test -- --ignored write_`.
-
-CI (`.github/workflows/ci.yml`) tests on Windows, macOS and Linux on every push.
-
-To release, bump `version` in `Cargo.toml` and push a matching tag (`git tag v0.1.1 &&
-git push origin v0.1.1`). `.github/workflows/release.yml` then builds Windows (x64, ARM64),
-a universal macOS app and Linux (x64, ARM64), and publishes them with `SHA256SUMS.txt`.
-
-## Layout
-
-```
-src/mft.rs            $MFT records, attributes, paths, hard links
-src/extract.rs        resident $DATA extraction to a password-protected ZIP
-src/usn.rs            USN journal records and $Max
-src/prefetch.rs       Prefetch (SCCA) parser
-src/xpress.rs         Xpress Huffman decompressor
-src/app.rs            window, MFT view, loading, shared UI
-src/app/journal*.rs   journal view and its folder tree
-src/app/pf.rs         prefetch view and cross-artifact links
-src/app/nav.rs        back / forward history
-src/app/search.rs     wildcard search
+cargo build --release
 ```
 
 ## Security
 
-Sediment opens files from possibly compromised machines; see [SECURITY.md](SECURITY.md)
-for how to report a parsing bug privately and what hardening is in place.
+Found a problem? Please report it privately: see [SECURITY.md](SECURITY.md).
 
 ## License
 
-[PolyForm Small Business License 1.0.0](LICENSE.md): free for organizations with fewer
-than 100 people and under US$1M revenue. Third-party notices: [NOTICE.md](NOTICE.md).
-
-[MS-XCA]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-xca/
+[PolyForm Small Business License 1.0.0](LICENSE.md): free for organizations with fewer than
+100 people and under US$1M in revenue. Larger organizations need a commercial license.
+Third-party notices: [NOTICE.md](NOTICE.md).

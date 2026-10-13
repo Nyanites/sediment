@@ -2,7 +2,6 @@
 //! loaded file into the `$MFT` and USN journal.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use chrono::{DateTime, Local, Utc};
 
@@ -287,26 +286,6 @@ fn on_disk(file: &MftFile, r: FileRef) -> OnDisk {
     }
 }
 
-/// Lists the files a folder drop / "Open folder" should load.
-pub(super) fn scan_folder(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let mut pf = Vec::new();
-    let mut other = Vec::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let p = entry.path();
-        if !p.is_file() {
-            continue;
-        }
-        let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if name.ends_with(".pf") {
-            pf.push(p);
-        } else if matches!(name.as_str(), "$mft" | "$j" | "$max") || name.ends_with("$j") {
-            other.push(p);
-        }
-    }
-    pf.sort();
-    (pf, other)
-}
-
 impl MftApp {
     pub(super) fn resolve_pf_file(&self, f: &FileMetric) -> Option<Resolved> {
         let file = self.file.as_ref()?;
@@ -324,7 +303,7 @@ impl MftApp {
         })
     }
 
-    fn ensure_mft_path_index(&mut self) {
+    pub(super) fn ensure_mft_path_index(&mut self) {
         if self.mft_path_index.is_none() {
             self.mft_path_index = self.file.as_ref().map(build_mft_path_index);
         }
@@ -376,16 +355,12 @@ impl MftApp {
         let v = &mut self.pf;
         if ui
             .button("🗁 Open folder…")
-            .on_hover_text("Load every .pf file in a folder, e.g. C:\\Windows\\Prefetch")
+            .on_hover_text("Load every prefetch file in a folder and its subfolders, e.g. C:\\Windows\\Prefetch")
             .clicked()
         {
             if let Some(dir) = rfd::FileDialog::new().set_directory(default_prefetch_dir()).pick_folder() {
-                let (pf, _) = scan_folder(&dir);
-                if pf.is_empty() {
-                    self.status_msg = Some(format!("No .pf files found in {}", dir.display()));
-                } else {
-                    self.open_prefetch_batch(pf, ui.ctx());
-                }
+                self.begin_open();
+                self.open(dir, ui.ctx());
             }
             return;
         }
@@ -447,7 +422,11 @@ impl MftApp {
         ui.separator();
 
         let matcher = Matcher::new(&v.list_filter);
+        let det = &self.det;
+        let only = det.filter();
+        let dark = ui.visuals().dark_mode;
         let mut order: Vec<usize> = (0..v.entries.len())
+            .filter(|&i| only.is_none_or(|f| f.contains(&crate::detect::Target::Prefetch(i as u32))))
             .filter(|&i| {
                 let n = v.entries[i].name().to_lowercase();
                 matcher.matches(&n, &n)
@@ -478,6 +457,10 @@ impl MftApp {
                         }
                         Ok(pf) => (RichText::new(&name), pf.run_count.to_string()),
                         Err(_) => (RichText::new(format!("⚠ {name}")).color(RED), "error".into()),
+                    };
+                    let text = match det.color(crate::detect::Target::Prefetch(i as u32), dark) {
+                        Some(c) => text.color(c),
+                        None => text,
                     };
                     ui.horizontal(|ui| {
                         ui.set_height(row_h);
@@ -627,7 +610,9 @@ impl MftApp {
         let v = &self.pf;
         let entry = &v.entries[idx];
         let links = v.links.as_ref().filter(|(s, _)| *s == idx).map(|(_, l)| l);
+        let mut det_click = None;
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            det_click = self.detection_links(ui, crate::detect::Target::Prefetch(idx as u32));
             section(ui, "Execution", |ui| {
                 kv(ui, "Executable", &pf.executable);
                 if let Some(tool) = pf.known_tool() {
@@ -865,6 +850,9 @@ impl MftApp {
         }
         if let Some(r) = go_journal {
             self.open_journal_for(r, None);
+        }
+        if let Some(rule) = det_click {
+            self.set_detection(Some(super::detections::Active::Rule(rule)));
         }
     }
 

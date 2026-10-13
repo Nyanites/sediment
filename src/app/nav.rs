@@ -106,8 +106,7 @@ impl MftApp {
                 }
             }
             _ => {
-                self.selected = None;
-                self.selected_record = None;
+                self.clear_selection();
                 self.mft_journal_hits.clear();
             }
         }

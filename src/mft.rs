@@ -1,6 +1,7 @@
 //! Minimal NTFS `$MFT` parser: FILE record headers, update-sequence fixups,
 //! and the attributes needed for a timeline/browse view.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const ROOT_RECORD: usize = 5;
@@ -291,6 +292,7 @@ impl Attribute {
 }
 
 /// A single MFT record after fixups, with its attributes decoded.
+#[derive(Clone)]
 pub struct Record {
     pub data: Vec<u8>,
     pub signature: [u8; 4],
@@ -487,6 +489,7 @@ pub struct Entry {
     pub in_use: bool,
     pub is_dir: bool,
     pub base_record: u64,
+    pub base_seq: u16,
     pub name: String,
     pub parent_record: u64,
     pub parent_seq: u16,
@@ -548,6 +551,7 @@ fn summarize(index: u64, rec: &Record) -> Entry {
         in_use: rec.in_use(),
         is_dir: rec.is_dir(),
         base_record: rec.base_record,
+        base_seq: rec.base_seq,
         ..Default::default()
     };
     let mut best_ns = 0u8;
@@ -616,6 +620,9 @@ pub struct MftFile {
     pub subdir_count: Vec<u32>,
     /// Named base records whose parent could not be resolved.
     pub orphans: Vec<u32>,
+    /// Extension records per base record, for files whose attributes did
+    /// not fit in one record.
+    pub extensions: HashMap<u32, Vec<u32>>,
 }
 
 impl MftFile {
@@ -646,6 +653,37 @@ impl MftFile {
         Record::parse(self.record_bytes(index))
     }
 
+    /// The record numbers that make up the file at `index`: its base record
+    /// first, then the extension records that belong to it. An extension
+    /// record's index gives the same set.
+    pub fn file_record_numbers(&self, index: usize) -> Vec<usize> {
+        let Some(e) = self.entries.get(index) else {
+            return Vec::new();
+        };
+        let base = match self.entries.get(e.base_record as usize) {
+            _ if e.base_record == 0 => index,
+            Some(b) if extends(b, e) => e.base_record as usize,
+            // An orphaned extension record stands on its own.
+            _ => return vec![index],
+        };
+        let b = &self.entries[base];
+        let mut nums = vec![base];
+        nums.extend(
+            self.extensions
+                .get(&(base as u32))
+                .into_iter()
+                .flatten()
+                .map(|&x| x as usize)
+                .filter(|&x| extends(b, &self.entries[x])),
+        );
+        nums
+    }
+
+    /// The parsed records of `file_record_numbers(index)`.
+    pub fn file_records(&self, index: usize) -> Vec<Record> {
+        self.file_record_numbers(index).into_iter().map(|i| self.parse_record(i)).collect()
+    }
+
     pub fn load(raw: Vec<u8>, progress: &AtomicUsize) -> MftFile {
         let record_size = Self::detect_record_size(&raw);
         let count = Self::record_count(raw.len(), record_size);
@@ -658,6 +696,12 @@ impl MftFile {
             }
         }
         merge_extension_records(&mut entries);
+        let mut extensions: HashMap<u32, Vec<u32>> = HashMap::new();
+        for e in &entries {
+            if e.valid && e.base_record != 0 && (e.base_record as usize) < entries.len() {
+                extensions.entry(e.base_record as u32).or_default().push(e.record as u32);
+            }
+        }
         resolve_parents(&mut entries);
         build_paths(&mut entries);
         for e in &mut entries {
@@ -673,8 +717,19 @@ impl MftFile {
             children,
             subdir_count,
             orphans,
+            extensions,
         }
     }
+}
+
+/// Whether `ext` is an extension record of `base`. NTFS bumps a record's
+/// sequence number when it frees it, so a deleted file's extension records
+/// refer to the number before that.
+fn extends(base: &Entry, ext: &Entry) -> bool {
+    ext.valid
+        && ext.base_record == base.record
+        && (ext.base_seq == base.sequence
+            || (!base.in_use && ext.base_seq == base.sequence.wrapping_sub(1)))
 }
 
 /// Large files spill attributes into extension records; fold the useful
