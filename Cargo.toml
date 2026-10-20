@@ -10,8 +10,8 @@ publish = false
 
 [dependencies]
 chrono = "0.4.45"
-eframe = "0.36.2"
-egui_extras = "0.36.2"
+eframe = "0.37.0"
+egui_extras = "0.37.0"
 rfd = "0.17.2"
 md-5 = "0.10"
 flate2 = "1"
